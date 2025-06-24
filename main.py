@@ -18,7 +18,8 @@ class GCodeEditor(QMainWindow):
         self.setWindowTitle("3D Printing Toolpath (G-code) Editor")
         self.setGeometry(100, 100, 650, 350)
         self.gcode_file_path = None
-        self.cleaned_gcode = None
+        self.cleaned_gcode = None # Will be deprecated, use cleaned_gcode_with_extruders
+        self.cleaned_gcode_with_extruders = [] # Stores tuples of (line, extruder_command_str)
         self.layer_indices = []
         self.layer_labels = []
         self.selected_layers = set()
@@ -78,6 +79,50 @@ class GCodeEditor(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
 
+        # --- UI Elements for Automatic Channel Processing ---
+        auto_process_layout = QHBoxLayout()
+        self.channel_extruder_label = QLabel("Channel Extruder (e.g., T1):")
+        auto_process_layout.addWidget(self.channel_extruder_label)
+
+        self.channel_extruder_input = QLineEdit()
+        self.channel_extruder_input.setPlaceholderText("T1")
+        self.channel_extruder_input.setFixedWidth(50)
+        auto_process_layout.addWidget(self.channel_extruder_input)
+
+        self.process_channel_button = QPushButton("Auto-Process Channels")
+        self.process_channel_button.setFont(QFont('Arial', 10))
+        self.process_channel_button.clicked.connect(self.trigger_auto_process_channels)
+        self.process_channel_button.setEnabled(False) # Enable when G-code is loaded
+        auto_process_layout.addWidget(self.process_channel_button)
+
+        auto_process_layout.addStretch() # Push elements to the left
+
+        main_layout.addLayout(auto_process_layout)
+        # --- End UI Elements for Automatic Channel Processing ---
+
+
+    def assign_extruders_to_lines(self, lines):
+        processed_lines = []
+        current_extruder_command = None # Stores the string like "T0", "T1"
+        for line in lines:
+            stripped_line = line.strip()
+            # Check for tool change command (e.g., T0, T1).
+            # It should not be part of a comment or other commands like G10.
+            # A simple check: starts with T, followed by digits, and is the only command on the line (before comments).
+            command_part = stripped_line.split(';')[0].strip() # Get command before any comment
+            words = command_part.split()
+            if len(words) > 0 and words[0].startswith('T'):
+                tool_cmd = words[0]
+                if len(tool_cmd) > 1 and tool_cmd[1:].isdigit():
+                    # Check if it's a standalone tool command, not something like "G1 X10 T1" (which is not standard)
+                    # Standard tool changes are usually on their own line: "T0"
+                    # Or sometimes with M6: "M6 T0" - but slicers often just use "T0"
+                    if len(words) == 1: # e.g. "T0"
+                        current_extruder_command = tool_cmd
+                    # Add more sophisticated parsing if M6 T<n> or other forms are common and need support
+            processed_lines.append((line, current_extruder_command))
+        return processed_lines
+
     def open_gcode_file(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Select G-code File", "", "G-code Files (*.gcode *.nc *.txt);;All Files (*)")
         if file_path:
@@ -88,16 +133,22 @@ class GCodeEditor(QMainWindow):
             self.status_bar.showMessage(f"Selected: {filename}")
             try:
                 with open(file_path, 'r') as file:
-                    gcode = file.readlines()
-                self.cleaned_gcode = self.remove_all_thumbnails(gcode)
-                self.parse_layers(self.cleaned_gcode)
+                    raw_lines = file.readlines()
+                temp_cleaned_lines = self.remove_all_thumbnails(raw_lines)
+                self.cleaned_gcode_with_extruders = self.assign_extruders_to_lines(temp_cleaned_lines)
+                # For compatibility, self.cleaned_gcode can store just the lines
+                self.cleaned_gcode = [item[0] for item in self.cleaned_gcode_with_extruders]
+                self.parse_layers(self.cleaned_gcode) # parse_layers uses self.cleaned_gcode for now
                 self.layer_button.setEnabled(True if self.layer_indices else False)
+                self.process_channel_button.setEnabled(True if self.cleaned_gcode_with_extruders else False) # Enable auto-process button
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to read file: {e}")
                 self.cleaned_gcode = None
+                self.cleaned_gcode_with_extruders = []
                 self.layer_indices = []
                 self.layer_labels = []
                 self.layer_button.setEnabled(False)
+                self.process_channel_button.setEnabled(False) # Disable on error
         else:
             self.status_bar.showMessage("No file selected.")
 
@@ -210,16 +261,23 @@ class GCodeEditor(QMainWindow):
             try:
                 # Build new G-code with edits, inserting at correct positions
                 new_gcode = []
-                layer_ptrs = self.layer_indices + [len(self.cleaned_gcode)]
+                layer_ptrs = self.layer_indices + [len(self.cleaned_gcode_with_extruders)]
                 for i, (start, end) in enumerate(zip(layer_ptrs[:-1], layer_ptrs[1:])):
                     # Always add ;LAYER_CHANGE at the start of each saved layer
-                    if self.cleaned_gcode[start].strip() != ';LAYER_CHANGE':
+                    # Access the line part of the tuple for comparison and appending
+                    if self.cleaned_gcode_with_extruders[start][0].strip() != ';LAYER_CHANGE':
                         new_gcode.append(';LAYER_CHANGE\n')
                     else:
-                        new_gcode.append(self.cleaned_gcode[start])
+                        new_gcode.append(self.cleaned_gcode_with_extruders[start][0])
+
                     if i in self.layer_edits:
-                        orig_lines = list(self.cleaned_gcode[start+1:end])  # skip the original ;LAYER_CHANGE
-                        # 1. Parse all moves and collect non-move lines with their indices
+                        # Extract only the G-code lines (first element of tuples) for parsing moves
+                        # The extruder info per line is implicitly handled if parse_moves (called by viewer) stored it in move dicts.
+                        # For now, the edit application logic relies on move dicts from layer_edits.
+                        original_layer_lines_with_extruders = self.cleaned_gcode_with_extruders[start+1:end]
+                        orig_lines = [item[0] for item in original_layer_lines_with_extruders] # Get just the text lines
+
+                        # 1. Parse all moves and collect non-move lines with their indices FROM TEXT LINES
                         moves = []
                         non_move_lines = []  # (idx, line)
                         gcode_to_move_idx = {}  # Map G-code line idx -> move idx
@@ -278,7 +336,9 @@ class GCodeEditor(QMainWindow):
                             gcode_lines.insert(idx, line)
                         new_gcode.extend(gcode_lines)
                     else:
-                        new_gcode.extend(self.cleaned_gcode[start+1:end])
+                        # Append original lines (text part only) if no edits for this layer
+                        original_lines_for_layer = [item[0] for item in self.cleaned_gcode_with_extruders[start+1:end]]
+                        new_gcode.extend(original_lines_for_layer)
                 with open(file_path, 'w') as file:
                     file.writelines(new_gcode)
                 self.status_bar.showMessage(f"Saved: {file_path}")
@@ -294,13 +354,19 @@ class GCodeEditor(QMainWindow):
             return
         idx = list(self.selected_layers)[0]
         start = self.layer_indices[idx]
-        end = self.layer_indices[idx+1] if idx+1 < len(self.layer_indices) else len(self.cleaned_gcode)
-        layer_lines = self.cleaned_gcode[start:end]
+        # Use self.cleaned_gcode_with_extruders to get the end index
+        end = self.layer_indices[idx+1] if idx+1 < len(self.layer_indices) else len(self.cleaned_gcode_with_extruders)
+
+        # Pass the list of (line, extruder_command) tuples for the selected layer
+        layer_lines_with_extruders = self.cleaned_gcode_with_extruders[start:end]
+
         moves_override = self.layer_edits.get(idx, None)
         if self.viewer_dialog is None:
-            self.viewer_dialog = Layer3DViewerDialog(layer_lines, mainwin=self, layer_idx=idx, moves_override=moves_override)
+            # Pass layer_lines_with_extruders to the viewer's constructor
+            self.viewer_dialog = Layer3DViewerDialog(layer_lines_with_extruders, mainwin=self, layer_idx=idx, moves_override=moves_override)
         else:
-            self.viewer_dialog.set_layer(layer_lines, layer_idx=idx, moves_override=moves_override)
+            # Pass layer_lines_with_extruders to the viewer's set_layer method
+            self.viewer_dialog.set_layer(layer_lines_with_extruders, layer_idx=idx, moves_override=moves_override)
         self.viewer_dialog.show()
         self.viewer_dialog.raise_()
         self.viewer_dialog.activateWindow()
@@ -324,6 +390,412 @@ class GCodeEditor(QMainWindow):
                 move_count += 1
         # If not found, return end of layer
         return len(self.layer_lines)
+
+    def trigger_auto_process_channels(self):
+        if not self.cleaned_gcode_with_extruders:
+            QMessageBox.warning(self, "Warning", "No G-code file loaded.")
+            return
+
+        channel_extruder_cmd = self.channel_extruder_input.text().strip()
+        if not channel_extruder_cmd:
+            QMessageBox.warning(self, "Input Required", "Please enter the channel extruder command (e.g., T1).")
+            return
+
+        # Validate format like T<number>
+        if not (channel_extruder_cmd.startswith('T') and channel_extruder_cmd[1:].isdigit()):
+            QMessageBox.warning(self, "Invalid Format", "Channel extruder should be in the format T<number> (e.g., T0, T1, T2).")
+            return
+
+        QMessageBox.information(self, "Auto-Process", f"Starting auto-processing for channel extruder: {channel_extruder_cmd}")
+
+        channel_segments = self.identify_channel_paths(channel_extruder_cmd)
+        if not channel_segments:
+            QMessageBox.information(self, "Auto-Process", f"No channel paths found for extruder {channel_extruder_cmd}.")
+            return
+        else:
+            QMessageBox.information(self, "Auto-Process", f"Found {len(channel_segments)} channel segments for {channel_extruder_cmd}. Next step would be extension (pending).")
+
+        # Placeholder for next step:
+        self.extend_toolpaths_around_channel(channel_segments, channel_extruder_cmd)
+
+    def _parse_layer_moves(self, layer_target_idx):
+        """
+        Parses moves for a specific layer index (from GCodeEditor's layer_indices).
+        Returns a list of tuples: (move_dict, original_line_idx_in_layer_lines).
+        move_dict includes 'x', 'y', 'z', 'e', 'type', 'extruder'.
+        'original_line_idx_in_layer_lines' is the index relative to the start of that layer's G-code lines
+        (excluding the initial ';LAYER_CHANGE' line itself).
+        """
+        if layer_target_idx < 0 or layer_target_idx >= len(self.layer_indices):
+            return []
+
+        layer_start_gcode_idx = self.layer_indices[layer_target_idx]
+        layer_end_gcode_idx = self.layer_indices[layer_target_idx + 1] if layer_target_idx + 1 < len(self.layer_indices) else len(self.cleaned_gcode_with_extruders)
+
+        # Get (line_text, extruder_command) tuples for the layer, skipping the initial ';LAYER_CHANGE'
+        # The gcode_idx for layer_edits should be relative to these layer_lines.
+        layer_lines_with_extruders_tuples = self.cleaned_gcode_with_extruders[layer_start_gcode_idx + 1 : layer_end_gcode_idx]
+
+        moves_with_original_indices = []
+        x = y = z = e = None
+        last_x = last_y = last_z = last_e = None # State for current layer's parsing
+        current_type = None # For things like ;TYPE:Perimeter
+
+        # Need to track the active extruder within this layer based on T commands if they exist IN THIS LAYER's lines
+        # However, self.assign_extruders_to_lines should have already given us extruder_for_line correctly.
+
+        for idx_in_layer, (line_text, extruder_for_line) in enumerate(layer_lines_with_extruders_tuples):
+            line = line_text.strip()
+
+            # Similar parsing logic to Layer3DViewerDialog.parse_moves
+            if line.startswith(';TYPE:External perimeter'):
+                current_type = 'external_perimeter'; continue
+            elif line.startswith(';TYPE:Perimeter'):
+                current_type = 'perimeter'; continue
+            elif line.startswith(';TYPE:'):
+                current_type = None; continue
+
+            if not line or line.startswith('M') or (line.startswith('T') and line[1:].isdigit()):
+                # Update last_x,y,z,e if a T command implies a new tool head position (rarely specified in G-code)
+                # For now, assume T commands don't change XYZ position.
+                continue
+
+            if line.startswith(('G0', 'G1', 'G01')):
+                parts = line.split()
+                move_x, move_y, move_z, move_e = None, None, None, None # Params for this specific line
+                has_xy_move = False
+                has_e_move = False
+
+                for part in parts:
+                    if part.startswith('X'): move_x = float(part[1:])
+                    elif part.startswith('Y'): move_y = float(part[1:])
+                    elif part.startswith('Z'): move_z = float(part[1:])
+                    elif part.startswith('E'):
+                        try: move_e = float(part[1:])
+                        except ValueError: pass
+
+                # Update coordinates: if not present in current G-code, use last known
+                if move_x is not None: x = move_x; has_xy_move = True
+                if move_y is not None: y = move_y; has_xy_move = True
+                if move_z is not None: z = move_z
+                if move_e is not None: e = move_e; has_e_move = True
+
+                if has_xy_move: # Only consider it a "move" for our list if X or Y changes
+                    is_travel = False
+                    if line.startswith('G0'): is_travel = True
+                    # For G1, travel if no E or E is not changing significantly
+                    elif not has_e_move or (last_e is not None and abs(e - last_e) < 1e-5):
+                        is_travel = True
+
+                    # Ensure z is not None (e.g. from previous moves or layer start Z)
+                    current_z_for_move = z if z is not None else (last_z if last_z is not None else 0)
+                    current_e_for_move = e if e is not None else (last_e if last_e is not None else 0)
+
+                    move_dict = {
+                        'x': x, 'y': y, 'z': current_z_for_move, 'e': current_e_for_move,
+                        'type': 'travel' if is_travel else current_type,
+                        'extruder': extruder_for_line,
+                        'original_line_in_layer': idx_in_layer # Store its original index within the layer's lines
+                    }
+                    moves_with_original_indices.append(move_dict)
+
+                    # Update last known state for next iteration
+                    if x is not None: last_x = x
+                    if y is not None: last_y = y
+                    if z is not None: last_z = z # z here is the 'current z for move' effectively
+                    if e is not None: last_e = e # e here is the 'current e for move'
+                elif move_z is not None: # Z-only move
+                    last_z = z # Update Z, but don't add to moves list unless it's an XY move
+
+            # G2/G3 Arc moves - simplified for now, treat like G1 for XY endpoint
+            elif line.startswith(('G2', 'G3')):
+                parts = line.split()
+                move_x, move_y, move_z, move_e = None, None, None, None
+                has_xy_move = False; has_e_move = False
+                for part in parts:
+                    if part.startswith('X'): move_x = float(part[1:])
+                    elif part.startswith('Y'): move_y = float(part[1:])
+                    elif part.startswith('Z'): move_z = float(part[1:])
+                    elif part.startswith('E'):
+                        try: move_e = float(part[1:])
+                        except ValueError: pass
+
+                if move_x is not None: x = move_x; has_xy_move = True
+                if move_y is not None: y = move_y; has_xy_move = True
+                if move_z is not None: z = move_z
+                if move_e is not None: e = move_e; has_e_move = True
+
+                if has_xy_move:
+                    is_travel = not has_e_move or (last_e is not None and abs(e - last_e) < 1e-5)
+                    current_z_for_move = z if z is not None else (last_z if last_z is not None else 0)
+                    current_e_for_move = e if e is not None else (last_e if last_e is not None else 0)
+                    move_dict = {
+                        'x': x, 'y': y, 'z': current_z_for_move, 'e': current_e_for_move,
+                        'type': 'travel' if is_travel else current_type, # G2/G3 are usually not 'perimeter' typed by slicer comments
+                        'extruder': extruder_for_line,
+                        'original_line_in_layer': idx_in_layer
+                    }
+                    moves_with_original_indices.append(move_dict)
+                    if x is not None: last_x = x
+                    if y is not None: last_y = y
+                    if z is not None: last_z = z
+                    if e is not None: last_e = e
+
+        return moves_with_original_indices
+
+
+    def extend_toolpaths_around_channel(self, channel_segments, channel_extruder_cmd_text):
+        """
+        Extends toolpaths in layers above and below the identified channel segments.
+        Modifications are prepared for self.layer_edits.
+        """
+        EXTENSION_DISTANCE = 0.5  # mm
+        PROXIMITY_THRESHOLD = 1.0 # mm, how close a path end needs to be to a channel end
+
+        if not channel_segments:
+            return
+
+        # Group channel segments by layer index for easier processing if needed, though iterating through is fine
+
+        for segment_idx, chan_segment in enumerate(channel_segments):
+            layer_channel_idx = chan_segment['layer_index']
+
+            # Define layers to check: one below, one above
+            layers_to_process = []
+            if layer_channel_idx > 0:
+                layers_to_process.append(layer_channel_idx - 1)  # Layer below
+            if layer_channel_idx < len(self.layer_indices) - 1:
+                layers_to_process.append(layer_channel_idx + 1)  # Layer above
+
+            for adj_layer_idx in layers_to_process:
+                if adj_layer_idx < 0 or adj_layer_idx >= len(self.layer_indices): # Should be caught by above but double check
+                    continue
+
+                adj_layer_moves = self._parse_layer_moves(adj_layer_idx)
+                if not adj_layer_moves:
+                    continue
+
+                # Store edits for this adjacent layer: {gcode_line_idx_in_layer: [new_move_dicts]}
+                # This will be merged into self.layer_edits later
+                current_layer_modifications = {}
+
+                # Iterate through moves in the adjacent layer
+                # We need the previous move to know the start of the current segment being checked
+                prev_adj_move = None
+                for i in range(len(adj_layer_moves)):
+                    current_adj_move_dict = adj_layer_moves[i]
+
+                    # Skip moves by the channel extruder itself in adjacent layers (unlikely but possible)
+                    if current_adj_move_dict['extruder'] == channel_extruder_cmd_text:
+                        if prev_adj_move: prev_adj_move = current_adj_move_dict # update prev before skipping
+                        else: prev_adj_move = current_adj_move_dict
+                        continue
+
+                    # We need a start point for the current adjacent move segment
+                    if prev_adj_move is None:
+                        # Try to find a G1 X Y Z E line before this to establish a start point,
+                        # or use (0,0, Z_of_current_move) if it's the very first move.
+                        # For simplicity, if it's the first move, we can't easily determine its incoming direction
+                        # to extend "backwards". So, we'll focus on extending the *end* of moves.
+                        # If we need to extend starts, we'd need more context or make assumptions.
+                        # Let's prime prev_adj_move here. If this is the first move, it has no "previous".
+                        # The first move in adj_layer_moves *is* the first G1/G0 with XY.
+                        # Its 'start' is effectively the state *before* it.
+                        # This parsing logic needs to be more robust to get start point of first move.
+                        # For now, this means we can only reliably extend the *end* of `prev_adj_move`
+                        # when `current_adj_move_dict` is being processed.
+
+                        # Let's adjust: a "segment" is from prev_adj_move to current_adj_move_dict
+                        # So, we process when we have at least one point.
+                        # The `current_adj_move_dict` represents the *end point* of a path segment.
+                        # The `prev_adj_move` (if exists) is the *start point*.
+
+                        # We are interested in the segment ending at current_adj_move_dict['x'], ['y']
+                        # and starting at prev_adj_move['x'], ['y'] (if prev_adj_move exists)
+
+                        # Simpler: consider each move in adj_layer_moves. Its (x,y,z) are its end point.
+                        # The start point is from the state *before* this move command.
+                        # Our _parse_layer_moves gives move_dict which has its end coords.
+                        # To get start coords of a move, we need the end_coords of the *previous* move in the list.
+
+                        # Let current_adj_path_segment_end be (current_adj_move_dict['x'], current_adj_move_dict['y'])
+                        # Let current_adj_path_segment_start be (prev_adj_move['x'], prev_adj_move['y']) if prev_adj_move else some default/origin
+
+                        if i == 0: # First move in the layer
+                            # Cannot easily determine its start point from previous G-code line in this simplified parsing.
+                            # So, we can't extend the "start" of the first path segment.
+                            # We *can* extend the *end* of this first path segment.
+                            prev_adj_move = current_adj_move_dict # current becomes prev for next iteration.
+                            continue # Process its end on the NEXT iteration, or handle specially if it's also the last.
+
+                    # Now, prev_adj_move is the start of the segment, current_adj_move_dict is the end.
+                    # Segment is from (prev_adj_move['x'], prev_adj_move['y']) to (current_adj_move_dict['x'], current_adj_move_dict['y'])
+
+                    # Check proximity of current_adj_move_dict (end of adj path) to chan_segment start/end
+                    adj_path_end_pt = np.array([current_adj_move_dict['x'], current_adj_move_dict['y']])
+                    chan_start_pt = np.array(chan_segment['start_xy'])
+                    chan_end_pt = np.array(chan_segment['end_xy'])
+
+                    # Is the adjacent path's END near the CHANNEL's START?
+                    dist_adj_end_to_chan_start = np.linalg.norm(adj_path_end_pt - chan_start_pt)
+                    # Is the adjacent path's END near the CHANNEL's END?
+                    dist_adj_end_to_chan_end = np.linalg.norm(adj_path_end_pt - chan_end_pt)
+
+                    target_channel_pt = None
+                    if dist_adj_end_to_chan_start < PROXIMITY_THRESHOLD:
+                        target_channel_pt = chan_start_pt
+                    elif dist_adj_end_to_chan_end < PROXIMITY_THRESHOLD:
+                        target_channel_pt = chan_end_pt
+
+                    if target_channel_pt is not None:
+                        # The segment ending at current_adj_move_dict is close to a channel end.
+                        # We want to extend this segment.
+                        adj_path_start_pt = np.array([prev_adj_move['x'], prev_adj_move['y']])
+                        original_adj_segment_vec = adj_path_end_pt - adj_path_start_pt
+                        original_adj_segment_len = np.linalg.norm(original_adj_segment_vec)
+
+                        if original_adj_segment_len > 1e-5: # Avoid division by zero for zero-length segments
+                            adj_segment_unit_vec = original_adj_segment_vec / original_adj_segment_len
+
+                            # New end point for the adjacent path segment
+                            new_adj_path_end_pt = adj_path_end_pt + adj_segment_unit_vec * EXTENSION_DISTANCE
+
+                            # Create a new move dictionary for the extended move.
+                            # This new move replaces `current_adj_move_dict`.
+                            modified_move = dict(current_adj_move_dict) # Copy
+                            modified_move['x'] = new_adj_path_end_pt[0]
+                            modified_move['y'] = new_adj_path_end_pt[1]
+
+                            # Recalculate E value
+                            original_extrusion_amount_for_segment = current_adj_move_dict['e'] - prev_adj_move['e']
+                            if abs(original_extrusion_amount_for_segment) > 1e-5 and not current_adj_move_dict.get('type') == 'travel':
+                                new_segment_len = np.linalg.norm(new_adj_path_end_pt - adj_path_start_pt)
+                                # if original_adj_segment_len was also checked > 1e-5
+                                new_extrusion_amount = original_extrusion_amount_for_segment * (new_segment_len / original_adj_segment_len)
+                                modified_move['e'] = prev_adj_move['e'] + new_extrusion_amount
+                            elif current_adj_move_dict.get('type') == 'travel':
+                                modified_move['e'] = prev_adj_move['e'] # Maintain E for travel
+                            # else: E was not changing, or it's the first extrusion, complex case. Keep E as is for now.
+
+                            # Store this modification
+                            # Key is the original G-code line index *within the layer's lines*
+                            original_gcode_idx_in_layer = current_adj_move_dict['original_line_in_layer']
+
+                            if adj_layer_idx not in self.layer_edits:
+                                self.layer_edits[adj_layer_idx] = []
+
+                            # The format for layer_edits is a list of (gcode_idx, [list_of_new_move_dicts])
+                            # We are replacing one move with one modified move.
+                            # Need to ensure we don't add duplicate gcode_idx entries if multiple channel segments affect the same adj move.
+                            # This simple approach might overwrite if that happens. A robust solution would merge edits.
+                            # For now, let's assume one modification per original line for simplicity of this first pass.
+
+                            # Remove existing edit for this line if present, then add new one.
+                            self.layer_edits[adj_layer_idx] = [
+                                edit for edit in self.layer_edits[adj_layer_idx]
+                                if edit[0] != original_gcode_idx_in_layer
+                            ]
+                            self.layer_edits[adj_layer_idx].append((original_gcode_idx_in_layer, [modified_move]))
+
+                            # Debugging print removed.
+                            # print(f"Layer {adj_layer_idx}: Modifying line {original_gcode_idx_in_layer} (orig end {adj_path_end_pt}) to new end {new_adj_path_end_pt.round(3)}")
+
+
+                    prev_adj_move = current_adj_move_dict # Current becomes previous for next iteration
+
+        if self.layer_edits:
+             QMessageBox.information(self, "Auto-Process", f"Toolpath extension logic applied. {len(self.layer_edits)} layers have modifications prepared. Save to apply.")
+        else:
+            QMessageBox.information(self, "Auto-Process", "No toolpaths were identified for extension.")
+
+
+    def identify_channel_paths(self, target_extruder_cmd):
+        """
+        Identifies G1 move segments made by the target_extruder_cmd.
+        Returns a list of dictionaries, each representing a channel segment.
+        Segment: {'layer_index': int, 'start_xy': (float, float), 'end_xy': (float, float), 'z': float, 'extruder': str}
+        """
+        if not self.cleaned_gcode_with_extruders:
+            return []
+
+        channel_segments = []
+        current_layer_index = -1
+        last_x, last_y, last_z = None, None, None
+
+        for line_idx, (line_text, line_extruder_cmd) in enumerate(self.cleaned_gcode_with_extruders):
+            line = line_text.strip()
+
+            if line == ';LAYER_CHANGE':
+                current_layer_index += 1
+                # Reset last known coordinates at layer change, as they are layer-specific
+                last_x, last_y, last_z = None, None, None
+                # PrusaSlicer and other slicers might issue a G1 Z move after LAYER_CHANGE
+                # So, we need to parse G1 immediately following to catch the Z.
+                # However, the first actual XY move will establish the real start for that layer.
+
+            if line.startswith(('G0', 'G1')): # Considering G0 as potential travel, G1 as extrusion/travel
+                parts = line.split()
+                current_x, current_y, current_z, current_e = None, None, None, None
+
+                for part in parts:
+                    if part.startswith('X'):
+                        current_x = float(part[1:])
+                    elif part.startswith('Y'):
+                        current_y = float(part[1:])
+                    elif part.startswith('Z'):
+                        current_z = float(part[1:])
+                    # E is not directly used for path definition but good to parse
+                    elif part.startswith('E'):
+                        try:
+                            current_e = float(part[1:])
+                        except ValueError:
+                            pass # Ignore if E is not a float
+
+                # Update Z if present, otherwise carry over last known Z. Crucial for first Z of a layer.
+                if current_z is not None:
+                    last_z = current_z
+
+                # An XY movement is required to define a segment
+                if current_x is not None and current_y is not None:
+                    if line_extruder_cmd == target_extruder_cmd:
+                        # This move is by the target extruder.
+                        # Requires a previous point to form a segment.
+                        if last_x is not None and last_y is not None and last_z is not None: # Ensure Z is known
+                            # Check if it's an extrusion move (E value changed or is present and positive)
+                            # For channel paths, we are typically interested in extrusion moves.
+                            # However, the prompt implies any path by the channel extruder.
+                            # Let's assume any G1 XY move by the channel extruder is part of the channel.
+                            # A more sophisticated check for actual extrusion (E value increasing) could be added if needed.
+                            is_extrusion_move = False # Default
+                            if 'E' in line and current_e is not None: # E parameter is present
+                                # A simple check: if E is present, assume extrusion for the channel path.
+                                # Slicers might use G1 for travel without E, or with E not changing.
+                                # For defining the channel itself, we primarily care about where material is laid.
+                                # This needs careful thought: if channel extruder makes a G1 travel move, is it part of "channel"?
+                                # For now, let's be inclusive if it's the target extruder.
+                                is_extrusion_move = True # Simplified: if it's G1 and target extruder, count it.
+
+                            # For now, any G1/G0 XY move by the channel extruder is considered.
+                            # We need a start (last_x, last_y) and end (current_x, current_y)
+                            segment = {
+                                'layer_index': current_layer_index,
+                                'start_xy': (last_x, last_y),
+                                'end_xy': (current_x, current_y),
+                                'z': last_z, # Z of the segment start
+                                'extruder': line_extruder_cmd
+                            }
+                            channel_segments.append(segment)
+
+                    # Update last known X, Y for the next segment calculation, regardless of extruder
+                    last_x, last_y = current_x, current_y
+                elif current_z is not None and last_x is None and last_y is None:
+                    # This handles cases like G1 Z<val> at the start of a layer before any XY moves.
+                    # We just update last_z. last_x, last_y remain None.
+                    pass
+
+
+        return channel_segments
+
 
 class LayerSelectorDialog(QDialog):
     def __init__(self, layer_labels, selected_layers, parent=None):
@@ -350,7 +822,7 @@ class LayerSelectorDialog(QDialog):
         return set([i.row() for i in self.list_widget.selectedIndexes()])
 
 class Layer3DViewerDialog(QDialog):
-    def __init__(self, layer_lines, parent=None, mainwin=None, layer_idx=None, moves_override=None):
+    def __init__(self, layer_lines_with_extruders, parent=None, mainwin=None, layer_idx=None, moves_override=None):
         super().__init__(parent)
         self.mainwin = mainwin
         self.layer_idx = layer_idx if layer_idx is not None else -1
@@ -363,8 +835,8 @@ class Layer3DViewerDialog(QDialog):
         self.setWindowTitle("3D Layer Viewer")
         self.setMinimumSize(900, 700)
         self.setWindowState(self.windowState() | Qt.WindowMaximized)
-        self.layer_lines = layer_lines
-        self.moves = self.parse_moves(layer_lines)
+        self.layer_lines_with_extruders = layer_lines_with_extruders # Store the new structure
+        self.moves = self.parse_moves(self.layer_lines_with_extruders) # Pass it to parse_moves
         self.edit_sessions = []  # List of dicts: {'origin_idx', 'current_idx', 'color', 'move_stack', 'origin_coords'}
         self.session_colors = [
             (1,0,0,1),      # Red
@@ -698,16 +1170,19 @@ class Layer3DViewerDialog(QDialog):
         if val < self.slider.maximum():
             self.slider.setValue(val+1)
 
-    def set_layer(self, layer_lines, layer_idx=None, moves_override=None):
-        self.layer_lines = layer_lines
+    def set_layer(self, layer_lines_with_extruders, layer_idx=None, moves_override=None): # Changed parameter name
+        self.layer_lines_with_extruders = layer_lines_with_extruders # Store the new structure
         if layer_idx is not None:
             self.layer_idx = layer_idx
         elif not hasattr(self, 'layer_idx'):
-            self.layer_idx = -1
+            self.layer_idx = -1 # Should ideally always have a layer_idx if layer is set
+
         if moves_override is not None:
-            self.moves = [dict(m) for m in moves_override]
+            # moves_override are already parsed move dictionaries, so just use them.
+            self.moves = [dict(m) for m in moves_override] # Ensure they are copied
         else:
-            self.moves = self.parse_moves(layer_lines)
+            # Parse from the new structure
+            self.moves = self.parse_moves(self.layer_lines_with_extruders)
         self.current_index = len(self.moves) if self.moves else 0
         self.slider.setMaximum(len(self.moves) if self.moves else 1)
         self.slider.setValue(self.current_index)
@@ -718,24 +1193,38 @@ class Layer3DViewerDialog(QDialog):
         self.session_color_idx = 0
         self.update_plot()
 
-    def parse_moves(self, lines):
+    def parse_moves(self, lines_with_extruders): # Parameter changed
         moves = []
         x = y = z = e = None
         last_x = last_y = last_z = last_e = None
         current_type = None
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith('M'):
-                continue
+        # current_extruder will be set by the T command from lines_with_extruders
+        # However, GCodeEditor.assign_extruders_to_lines already provides this per line.
+
+        for line_item in lines_with_extruders: # Iterate through tuples
+            line_text, extruder_for_line = line_item # Unpack the tuple
+            line = line_text.strip()
+
+            if not line or line.startswith('M'): # Skip M codes for move parsing, T codes are handled by extruder_for_line
+                # Tool change commands (T0, T1 etc.) are not moves themselves.
+                # Their effect (active extruder) is already captured in extruder_for_line.
+                if line.startswith('T') and line[1:].isdigit(): # Example: T0
+                    # This is just confirming we see it, but extruder_for_line is the source of truth for the move.
+                    pass
+                else:
+                    continue # Skip other M codes or empty/comment lines for move parsing
+
             if line.startswith(';TYPE:External perimeter'):
                 current_type = 'external_perimeter'
                 continue
             elif line.startswith(';TYPE:Perimeter'):
                 current_type = 'perimeter'
                 continue
-            elif line.startswith(';TYPE:'):
+            elif line.startswith(';TYPE:'): # Clear type if a generic ;TYPE: comment is encountered
                 current_type = None
                 continue
+
+            # G0, G1, G01 are motion commands
             if line.startswith('G0') or line.startswith('G1') or line.startswith('G01'):
                 parts = line.split()
                 for part in parts:
@@ -751,14 +1240,27 @@ class Layer3DViewerDialog(QDialog):
                         except ValueError:
                             pass
                 is_travel = False
-                if last_e is not None and (e is None or e == last_e):
+                if last_e is not None and (e is None or e == last_e): # Basic travel detection
                     is_travel = True
-                if x is not None and y is not None:
-                    moves.append({'x': x, 'y': y, 'z': z if z is not None else (last_z if last_z is not None else 0),
-                                  'e': e if e is not None else (last_e if last_e is not None else 0),
-                                  'type': 'travel' if is_travel else current_type})
+
+                # More robust travel detection: G0 is often explicitly travel
+                if line.startswith('G0') and not any(p.startswith('E') for p in parts if p and p[0] == 'E' and len(p) > 1): # G0 without E is travel
+                    is_travel = True
+
+                # If G1 has no E, it's also travel (unless it's a Z-only move, which can be travel or part of print)
+                # The existing logic e is None or e == last_e handles this well for G1.
+
+                if x is not None and y is not None: # A move must have at least X and Y
+                    move_dict = {
+                        'x': x, 'y': y,
+                        'z': z if z is not None else (last_z if last_z is not None else 0),
+                        'e': e if e is not None else (last_e if last_e is not None else 0),
+                        'type': 'travel' if is_travel else current_type,
+                        'extruder': extruder_for_line # Store the active extruder command
+                    }
+                    moves.append(move_dict)
                     last_x, last_y, last_z, last_e = x, y, z if z is not None else last_z, e if e is not None else last_e
-            elif line.startswith('G2') or line.startswith('G3'):
+            elif line.startswith('G2') or line.startswith('G3'): # Arc moves
                 parts = line.split()
                 for part in parts:
                     if part.startswith('X'):
@@ -773,12 +1275,20 @@ class Layer3DViewerDialog(QDialog):
                         except ValueError:
                             pass
                 is_travel = False
-                if last_e is not None and (e is None or e == last_e):
+                if last_e is not None and (e is None or e == last_e): # Basic travel detection
                     is_travel = True
-                if x is not None and y is not None:
-                    moves.append({'x': x, 'y': y, 'z': z if z is not None else (last_z if last_z is not None else 0),
-                                  'e': e if e is not None else (last_e if last_e is not None else 0),
-                                  'type': 'travel' if is_travel else current_type})
+                # Arc moves (G2/G3) usually imply extrusion if E is present and changing.
+                # If E is not present or not changing, it could be a travel arc.
+
+                if x is not None and y is not None: # A move must have at least X and Y
+                    move_dict = {
+                        'x': x, 'y': y,
+                        'z': z if z is not None else (last_z if last_z is not None else 0),
+                        'e': e if e is not None else (last_e if last_e is not None else 0),
+                        'type': 'travel' if is_travel else current_type, # Assuming current_type applies unless it's travel
+                        'extruder': extruder_for_line # Store the active extruder command
+                    }
+                    moves.append(move_dict)
                     last_x, last_y, last_z, last_e = x, y, z if z is not None else last_z, e if e is not None else last_e
         return moves
 
@@ -828,15 +1338,21 @@ class Layer3DViewerDialog(QDialog):
     # Map a move index (from self.moves) to the corresponding G-code line index in self.layer_lines.
     def move_index_to_gcode_line(self, move_idx):
         move_count = 0
-        for i, line in enumerate(self.layer_lines):
-            line = line.strip()
-            if not line or line.startswith('M'):
-                continue
+        # Iterate over self.layer_lines_with_extruders, but use only the line text for logic
+        for i, line_item in enumerate(self.layer_lines_with_extruders):
+            line_text, _ = line_item # Unpack, we only need the text part here
+            line = line_text.strip()
+            if not line or line.startswith('M'): # T-codes are M-like in structure for this check
+                if line.startswith('T') and line[1:].isdigit(): # Explicitly skip T-codes as non-moves
+                    pass # Or continue, but the M check might catch it if it's not G
+                else:
+                    continue
+
             if line.startswith('G0') or line.startswith('G1') or line.startswith('G01') or line.startswith('G2') or line.startswith('G3'):
                 if move_count == move_idx:
-                    return i
+                    return i # Return the index in the layer_lines_with_extruders list
                 move_count += 1
-        return len(self.layer_lines)
+        return len(self.layer_lines_with_extruders) # If not found, return end of layer
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
